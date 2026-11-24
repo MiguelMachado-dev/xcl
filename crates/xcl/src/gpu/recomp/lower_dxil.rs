@@ -698,22 +698,26 @@ mod tests {
 
     /// Coalesced guarded runs lowered through `Ir::foreign` (`Lw::inst_guarded` with `guard = true`
     /// inside the run's block): f32 arithmetic against HLSL, and 4-window memory load/store inside
-    /// a coalesced run (`Lw` making window-switch blocks inside the run) against the CPU lowering.
+    /// a coalesced run (wave32 and split wave64, `Lw` making window-switch blocks inside the run)
+    /// against the CPU lowering.
     #[test]
     fn coalesced_foreign_runs_agree_on_the_gpu() {
         if !gpu() {
             return;
         }
-        // 4-window compute: lanes with tid < 16 run a coalesced load + add + store via `foreign`
+        // 4-window compute: lanes below the cut (16 in wave32; 40 in split wave64, spanning both
+        // wave32 halves) run a coalesced load + add + store via `foreign`
         let cs = compute_cs();
-        let run = coalesced_run(false);
-        let bytes: Vec<u8> = run.iter().flat_map(encode_line).collect();
-        let o = super::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
-        let k = super::compute_with(&bytes, &cs, o).unwrap();
         let mem = memory_image();
-        let out = runner::dispatch(&k.dxil, [1, 1, 1], &[0, 0], &mem).unwrap();
-        let cpu = run_compute(&run, &cs, 1, &[0, 0], &mem);
-        assert_eq!(&out[..cpu.len()], &cpu[..], "4-window coalesced memory via foreign");
+        for (wave64, split) in [(false, false), (true, true)] {
+            let run = coalesced_run(wave64);
+            let bytes: Vec<u8> = run.iter().flat_map(encode_line).collect();
+            let o = super::KernelOptions { wave64, split, mem_windows: 4, sampler_base: 0 };
+            let k = super::compute_with(&bytes, &cs, o).unwrap();
+            let out = runner::dispatch(&k.dxil, [1, 1, 1], &[0, 0], &mem).unwrap();
+            let cpu = run_compute_waves(&run, &cs, wave64, 1, &[0, 0], &mem);
+            assert_eq!(&out[..cpu.len()], &cpu[..], "4-window coalesced memory via foreign (wave64={wave64}, split={split})");
+        }
 
         if dxc::location().is_err() {
             runner::skip_test("no DXC");
