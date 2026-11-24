@@ -165,6 +165,15 @@ struct Lower<'a, I: Ir> {
     /// per IR block: not every lane that reached one of the program's lane branches gets here
     /// before they meet again (a loop that lanes leave one by one, an arm some lanes skip)
     partial: Vec<bool>,
+    /// stale-value ownership for blocks split by a coalesced run: backbone blocks of console
+    /// block b (`blk(b)` and its continuations) share `blk(b)` for both defs and uses, while a
+    /// run's inner block keeps its own `def_owner` (any def there is partial to outside reads)
+    /// and `blk(b)` as its `use_owner` (reads of earlier defs in the same console block stay valid)
+    def_owner: Vec<usize>,
+    use_owner: Vec<usize>,
+    /// inside a coalesced guarded run's own block: only lanes with EXEC set enter, so writes
+    /// need no per-instruction guard
+    unguarded: bool,
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
@@ -195,6 +204,110 @@ fn whole_quad(name: &str) -> bool {
         Some(rest) => !rest.split('_').any(|t| matches!(t, "L" | "LZ" | "D" | "CD")),
         None => false,
     }
+}
+
+/// Cross-lane and wave-level ops stay out of coalesced guarded runs (they need the parent
+/// block's lane participation, e.g. fetch-inactive or whole-wave mask reads).
+fn is_cross_lane(d: &Decoded) -> bool {
+    let n = d.inst.name;
+    matches!(d.variant, Variant::Dpp16 | Variant::Dpp8)
+        || n.starts_with("V_PERMLANE")
+        || n.starts_with("V_MBCNT_")
+        || n.starts_with("V_READLANE")
+        || n.starts_with("V_READFIRSTLANE")
+        || n.starts_with("V_WRITELANE")
+        || n.starts_with("DS_SWIZZLE")
+        || n.starts_with("DS_BPERMUTE")
+        || n.starts_with("DS_PERMUTE")
+}
+
+/// Any write to an SGPR, mask (VCC / EXEC / M0), or SCC must run for all lanes outside a
+/// coalesced run (inactive lanes clear their bit in a VALU mask write rather than keeping it).
+fn writes_scalar_or_scc(d: &Decoded) -> bool {
+    let (_, written) = super::x64_masks::uses(d);
+    let (_, explicit_w) = rdna2::sgpr_uses(d);
+    let writes = explicit_w.iter().fold(written, |m, &r| m | 1u128 << r) & !(1u128 << 125);
+    writes != 0
+        || d.inst.name.starts_with("V_CMPX")
+        || d.ienc
+            .operands
+            .iter()
+            .any(|o| o.output && matches!(o.ty, "OPR_VCC" | "OPR_EXEC" | "OPR_SDST_EXEC" | "OPR_SDST_M0" | "OPR_SSRC_SPECIAL_SCC"))
+}
+
+/// Pure no-ops in this lowering: allowed inside a coalesced run without breaking it.
+fn is_run_noop(d: &Decoded) -> bool {
+    matches!(
+        d.inst.name,
+        "V_NOP" | "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE"
+    )
+}
+
+/// Guarded instructions with side effects that inactive lanes must not execute even alone.
+fn must_branch(d: &Decoded) -> bool {
+    let n = d.inst.name;
+    is_store(d)
+        || n.contains("_STORE_")
+        || n.starts_with("IMAGE_STORE")
+        || n.contains("_ATOMIC_")
+        || (n.starts_with("DS_") && !n.starts_with("DS_READ") && !n.starts_with("DS_NOP"))
+        || n == "EXP"
+}
+
+fn can_coalesce(d: &Decoded, guarded: &HashSet<u64>) -> bool {
+    guarded.contains(&d.pc) && !is_cross_lane(d) && !whole_quad(d.inst.name) && !writes_scalar_or_scc(d)
+}
+
+/// Exclusive end of a block's non-terminator instructions.
+fn block_body_end(insts: &[Decoded], range: &std::ops::Range<usize>) -> usize {
+    let mut end = range.end;
+    if end > range.start {
+        let d = &insts[end - 1];
+        let name = d.inst.name;
+        if name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM") || d.far_target.is_some() {
+            end -= 1;
+        }
+    }
+    end
+}
+
+/// Straight-line runs of guarded instructions in one console block that benefit from a single
+/// per-lane EXEC branch instead of per-write `select`s (or per-store branches): any run with
+/// a `must_branch` instruction or at least two guarded instructions.
+fn coalesced_runs(insts: &[Decoded], range: &std::ops::Range<usize>, guarded: &HashSet<u64>) -> Vec<std::ops::Range<usize>> {
+    let end = block_body_end(insts, range);
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut last_end = 0usize;
+    let mut inst_count = 0usize;
+    let mut branch = false;
+    let mut flush = |start: &mut Option<usize>, last_end: usize, inst_count: &mut usize, branch: &mut bool| {
+        if let Some(s) = start.take() {
+            if *branch || *inst_count >= 2 {
+                runs.push(s..last_end);
+            }
+            *inst_count = 0;
+            *branch = false;
+        }
+    };
+    for i in range.start..end {
+        let d = &insts[i];
+        if is_run_noop(d) {
+            continue;
+        }
+        if can_coalesce(d, guarded) {
+            if start.is_none() {
+                start = Some(i);
+            }
+            last_end = i + 1;
+            inst_count += 1;
+            branch |= must_branch(d);
+        } else {
+            flush(&mut start, last_end, &mut inst_count, &mut branch);
+        }
+    }
+    flush(&mut start, last_end, &mut inst_count, &mut branch);
+    runs
 }
 
 /// IR block of analysis block b (block 0 is the prologue).
@@ -333,7 +446,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             None => v,
         };
-        let v = if self.guarded.contains(&d.pc) {
+        let v = if !self.unguarded && self.guarded.contains(&d.pc) {
             let old = self.read(b, Var::V(r));
             let e = self.read_bit(b, EXEC)?;
             self.ir.select(e, v, old)
@@ -791,9 +904,9 @@ impl<'a, I: Ir> Lower<'a, I> {
         Ok(())
     }
 
-    /// `global_` / `flat_` `load` / `store_dword{,x2,x3,x4}` on the flat memory. A guarded load
-    /// keeps the old register in lanes without their EXEC bit (`write_v`); a guarded store is
-    /// lowered in a block only those lanes enter (the caller's split).
+    /// `global_` / `flat_` `load` / `store_dword{,x2,x3,x4}` on the flat memory. A standalone
+    /// guarded load keeps the old register in lanes without their EXEC bit (`write_v`); guarded
+    /// stores and coalesced runs are lowered unguarded in a block only those lanes enter (`splits`).
     fn vmem(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
         if self.ir.mem_windows() > 1 {
@@ -884,7 +997,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 Some(ops) => work.extend_from_slice(ops),
                 None => {
                     if let Some(&b) = self.def_block.get(&v) {
-                        if b != c && self.partial[b] {
+                        if self.def_owner[b] != self.use_owner[c] && self.partial[b] {
                             return true;
                         }
                     }
@@ -1012,28 +1125,32 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
     }
     // IR blocks: 0 prologue, 1..=n the program's, n + 1 exit, n + 2 lane 0's scalar stores,
     // n + 3 every lane's vector stores, n + 4 the way to the exit of lanes outside EXEC at launch,
-    // then for every guarded store (only the lanes with their EXEC bit may write): the block of
-    // the store and the one the rest of its block continues in. `tail[b]`: the IR block the
+    // then for every coalesced guarded run (only the lanes with their EXEC bit enter): the run's
+    // block and the one the rest of its block continues in. `tail[b]`: the IR block the
     // program's block b ends in.
     let (exit, sstore, vstore, skip) = (n + 1, n + 2, n + 3, n + 4);
     let guarded: HashSet<u64> = sum.guarded.iter().copied().collect();
-    let mut splits: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n]; // (inst, store, cont)
+    let mut splits: Vec<Vec<(std::ops::Range<usize>, usize, usize)>> = vec![Vec::new(); n]; // (run, body, cont)
     let mut count = n + 5;
     for (b, block) in sum.blocks.iter().enumerate() {
-        for i in block.insts.clone() {
-            if is_store(&insts[i]) && guarded.contains(&insts[i].pc) {
-                splits[b].push((i, count, count + 1));
-                count += 2;
-            }
+        for run in coalesced_runs(insts, &block.insts, &guarded) {
+            splits[b].push((run, count, count + 1));
+            count += 2;
         }
     }
     let tail: Vec<usize> = (0..n).map(|b| splits[b].last().map_or(blk(b), |s| s.2)).collect();
     let mut partial = vec![false; count];
+    let mut def_owner: Vec<usize> = (0..count).collect();
+    let mut use_owner: Vec<usize> = (0..count).collect();
     for (b, p) in partial_blocks(&sum).into_iter().enumerate() {
         partial[blk(b)] = p;
         for &(_, s, c) in &splits[b] {
             partial[s] = true;
             partial[c] = p;
+            def_owner[s] = s;
+            use_owner[s] = blk(b);
+            def_owner[c] = blk(b);
+            use_owner[c] = blk(b);
         }
     }
     let ends: Vec<usize> = sum.order.iter().copied().filter(|&b| sum.blocks[b].succ.is_empty()).collect();
@@ -1081,6 +1198,9 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         bit_uses: Vec::new(),
         lane: None,
         partial,
+        def_owner,
+        use_owner,
+        unguarded: false,
         def_block: std::collections::HashMap::new(),
         lane_uses: Vec::new(),
         dpp_src: None,
@@ -1238,49 +1358,40 @@ fn lower_with<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I, s
         }
         let block = &sum.blocks[b];
         let last = block.insts.end - 1;
+        let body_end = block_body_end(insts, &block.insts);
         let mut cur = ib;
         let mut split = splits[b].iter().peekable();
-        for i in block.insts.clone() {
-            let d = &insts[i];
-            let name = d.inst.name;
-            if i == last && (name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM") || d.far_target.is_some()) {
-                break;
-            }
-            if matches!(stage, Stage::Pixel) && whole_quad(name) && l.partial[cur] {
-                l.note_inst(Err(format!("{name}: needs whole quads, in a block not every lane reaches")), cur, d)?;
-                continue;
-            }
-            if let Some(&(_, s, c)) = split.next_if(|x| x.0 == i) {
-                // a guarded store: only the lanes with their EXEC bit go through its block
+        let mut i = block.insts.start;
+        while i < body_end {
+            if let Some(&(ref run, s, c)) = split.next_if(|x| x.0.start == i) {
+                // a coalesced guarded run: only the lanes with their EXEC bit enter `s`,
+                // lowered unguarded; updated registers merge through SSA phis at `c`
                 let e = l.read_bit(cur, EXEC)?;
                 l.ir.br_if(e, s, c);
                 done[cur] = true;
                 l.ir.at(s);
                 l.ssa.seal(&mut l.ir, s);
-                let r = l.vmem(s, d);
-                let r = l.or_bridge(r, s, d, true);
-                l.note_inst(r, s, d)?;
+                l.unguarded = true;
+                for j in run.clone() {
+                    let r = l.lower_inst(s, &insts[j]);
+                    l.note_inst(r, s, &insts[j])?;
+                }
+                l.unguarded = false;
                 l.ir.br(c);
                 done[s] = true;
                 l.ir.at(c);
                 l.ssa.seal(&mut l.ir, c);
                 cur = c;
+                i = run.end;
             } else {
-                let r = if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
-                    l.smem(cur, d)
-                } else if name.starts_with("S_") {
-                    l.salu(cur, d)
-                } else if name.starts_with("V_") {
-                    l.valu(cur, d)
-                } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
-                    l.vmem(cur, d)
-                } else if name == "DS_SWIZZLE_B32" {
-                    l.swizzle(cur, d)
+                let d = &insts[i];
+                if matches!(stage, Stage::Pixel) && whole_quad(d.inst.name) && l.partial[cur] {
+                    l.note_inst(Err(format!("{}: needs whole quads, in a block not every lane reaches", d.inst.name)), cur, d)?;
                 } else {
-                    Err(format!("unsupported {name}"))
-                };
-                let r = l.or_bridge(r, cur, d, false);
-                l.note_inst(r, cur, d)?;
+                    let r = l.lower_inst(cur, d);
+                    l.note_inst(r, cur, d)?;
+                }
+                i += 1;
             }
         }
         match block.succ.as_slice() {
@@ -1427,12 +1538,12 @@ impl<I: Ir> Lower<'_, I> {
     /// so that a later read does not report a refusal that only follows from this one.
     /// An instruction this lowering has no semantics of, through `Ir::foreign` (#1426's
     /// per-instruction lowering) with the lane-mask analysis's guard: `true` where EXEC is proven
-    /// (or in a guarded store's own block, `in_store_block`), else the lane's EXEC bit. Its SGPR
+    /// (or inside a coalesced guarded run's block, `in_guarded_run`), else the lane's EXEC bit. Its SGPR
     /// operands are read as numbers (a mask read whole is refused, as everywhere), the mask a
     /// VALU reads lane by lane (`v_cndmask_b32`'s selector, a carry-in) as a number holding only
     /// this lane's bit, and a mask it writes (a compare, a carry-out) comes back as this lane's
     /// bit of the ballot it makes. Of the instructions writing EXEC, only `v_cmpx_*` is taken.
-    fn bridge(&mut self, b: usize, d: &Decoded, in_store_block: bool) -> R<()> {
+    fn bridge(&mut self, b: usize, d: &Decoded, in_guarded_run: bool) -> R<()> {
         let name = d.inst.name;
         let (whole, written) = super::x64_masks::uses(d);
         let (_, explicit_w) = rdna2::sgpr_uses(d);
@@ -1526,7 +1637,7 @@ impl<I: Ir> Lower<'_, I> {
         if writes_scc {
             outputs.push(Var::Scc);
         }
-        let guard = if cmpx || in_store_block || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
+        let guard = if cmpx || in_guarded_run || !self.guarded.contains(&d.pc) { self.ir.boolean(true) } else { self.read_bit(b, EXEC)? };
         let vals = self.ir.foreign(d, guard, &inputs, &outputs)?;
         for (&var, &v) in outputs.iter().zip(&vals) {
             match var {
@@ -1571,10 +1682,29 @@ impl<I: Ir> Lower<'_, I> {
         Ok(())
     }
 
+    /// Lowers one non-terminator instruction in block `b`, falling back to `bridge`.
+    fn lower_inst(&mut self, b: usize, d: &Decoded) -> R<()> {
+        let name = d.inst.name;
+        let r = if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
+            self.smem(b, d)
+        } else if name.starts_with("S_") {
+            self.salu(b, d)
+        } else if name.starts_with("V_") {
+            self.valu(b, d)
+        } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
+            self.vmem(b, d)
+        } else if name == "DS_SWIZZLE_B32" {
+            self.swizzle(b, d)
+        } else {
+            Err(format!("unsupported {name}"))
+        };
+        self.or_bridge(r, b, d, self.unguarded)
+    }
+
     /// `r`, or an instruction it calls unsupported lowered through `bridge`.
-    fn or_bridge(&mut self, r: R<()>, b: usize, d: &Decoded, in_store_block: bool) -> R<()> {
+    fn or_bridge(&mut self, r: R<()>, b: usize, d: &Decoded, in_guarded_run: bool) -> R<()> {
         match r {
-            Err(e) if e.starts_with("unsupported ") => match self.bridge(b, d, in_store_block) {
+            Err(e) if e.starts_with("unsupported ") => match self.bridge(b, d, in_guarded_run) {
                 Ok(()) => Ok(()),
                 Err(f) if f == "no foreign lowering" => Err(e),
                 Err(f) => Err(format!("{e} ({f})")),
@@ -1680,6 +1810,12 @@ pub(crate) mod tests {
                 v = n;
             }
             v
+        }
+        fn selects(&self) -> usize {
+            self.blocks.iter().map(|(ins, _)| ins.iter().filter(|(_, op)| matches!(op, Ins::Select(..))).count()).sum()
+        }
+        fn br_ifs(&self) -> usize {
+            self.blocks.iter().filter(|(_, t)| matches!(t, Term::BrIf(..))).count()
         }
     }
 
@@ -3845,5 +3981,256 @@ pub(crate) mod tests {
         }
         agrees_with_hlsl("lane reads, wave64", &lane_reads(true), true, &[]);
         agrees_with_hlsl("waterfall, wave64", &waterfall(true), true, &[2, 4, 5]);
+    }
+
+    /// Guarded straight-line run under narrowed EXEC (no skip branch): VALU ops, a guarded load,
+    /// `s_waitcnt`, and two guarded stores all coalesce into one per-lane branch with 0 selects.
+    pub(crate) fn coalesced_run(wave64: bool) -> Vec<I> {
+        let (cmp, save, restore): (&'static [(&'static str, u64)], &str, &str) = if wave64 {
+            (&[("SRC0", 168), ("VSRC1", 0)], "S_AND_SAVEEXEC_B64", "S_OR_B64")
+        } else {
+            (&[("SRC0", 144), ("VSRC1", 0)], "S_AND_SAVEEXEC_B32", "S_OR_B32")
+        };
+        vec![
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_CMP_GT_U32", "ENC_VOPC", cmp),
+            (save, "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 138), ("VSRC1", 0)]),
+            ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 2), ("SRC1", 131)]),
+            ("V_XOR_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 3), ("VSRC1", 0)]),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 5), ("ADDR", 8), ("SADDR", 125), ("OFFSET", 0)]),
+            ("S_WAITCNT", "ENC_SOPP", &[("SIMM16", 0)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 5), ("VSRC1", 2)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 4), ("SADDR", 125), ("OFFSET", 0x100)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 6), ("SADDR", 125), ("OFFSET", 0x200)]),
+            (restore, "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 4), ("VSRC1", 6)]),
+            ENDPGM,
+        ]
+    }
+
+    /// Guarded runs separated by a scalar write, a `v_cmp`, and a cross-lane `v_readlane`, plus
+    /// `v_cndmask` and a twice-written VGPR inside coalesced runs.
+    pub(crate) const COALESCED_BREAKS: &[I] = &[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 133)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 135), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 1), ("VSRC1", 0)]),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 131)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 2), ("VSRC1", 1)]),
+        ("V_XOR_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 3), ("VSRC1", 2)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 136), ("VSRC1", 0)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 3), ("VSRC1", 4)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 129), ("VSRC1", 5)]),
+        ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", 131)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 3), ("VSRC1", 6)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 130), ("VSRC1", 7)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ENDPGM,
+    ];
+
+    /// Two coalesced runs separated by a scalar write inside an already-`partial` block (arm of a
+    /// skipped `if`), reading SGPR `s2` and `vcc` written earlier in that same console block.
+    pub(crate) const COALESCED_IN_PARTIAL: &[I] = &[
+        ("S_AND_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 126), ("SSRC1", 128)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 152), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 10)]),
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 139)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 140), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 106)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 2), ("VSRC1", 0)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 1)]),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 2), ("VSRC1", 2)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 3)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 1)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 2), ("VSRC1", 4)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 129), ("VSRC1", 5)]),
+        ENDPGM,
+    ];
+
+    /// A 4-iteration uniform loop whose body narrows EXEC (no skip branch) around a coalesced run.
+    pub(crate) const COALESCED_IN_LOOP: &[I] = &[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 128)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 2), ("SSRC1", 129)]),
+        ("S_CMP_LT_U32", "ENC_SOPC", &[("SSRC0", 2), ("SSRC1", 132)]),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFF9)]),
+        ENDPGM,
+    ];
+
+    /// Guarded run of f32 instructions lowered through `Ir::foreign` (`Lw::inst_guarded`).
+    pub(crate) const COALESCED_F32_RUN: &[I] = &[
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 242), ("VSRC1", 1)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 244), ("VSRC1", 2)]),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 3), ("SRC1", 240), ("SRC2", 242)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 242), ("VSRC1", 4)]),
+        ENDPGM,
+    ];
+
+    #[test]
+    fn guarded_run_coalesces_into_one_branch_with_no_selects() {
+        for (wave64, lanes, cut) in [(false, 32usize, 16usize), (true, 64usize, 40usize)] {
+            let lines = coalesced_run(wave64);
+            let insts = decode(&lines);
+            let sum = lane_masks::analyze(&insts, wave64).unwrap();
+            assert_eq!(sum.guarded.len(), 7, "wave64={wave64}");
+            let (ir, stale) = lower_kernel(&insts, wave64, Interp::default()).unwrap();
+            assert!(stale.is_empty(), "{stale:?}");
+            // wave64 has 1 prologue select to pick EXEC's lo/hi dword; 0 per-write selects in either mode
+            assert_eq!(ir.selects(), usize::from(wave64), "wave64={wave64}: coalesced run removes all per-write selects");
+            assert_eq!(ir.br_ifs(), 3, "wave64={wave64}: entry + 1 coalesced run + exit");
+
+            let (s, v) = state(lanes);
+            let (s, v, mem) = run_mem(&lines, wave64, &s, &v, &memory_image());
+            assert_eq!(s[126], u32::MAX);
+            if wave64 {
+                assert_eq!(s[127], u32::MAX);
+            }
+            for l in 0..lanes {
+                let l32 = l as u32;
+                if l < cut {
+                    let (v2, v5) = (l32 + 10, 1000 + l32);
+                    let (v3, v6) = (v2 * 3, v5 + v2);
+                    let v4 = v3 ^ l32;
+                    assert_eq!((v[l][2], v[l][3], v[l][4], v[l][5], v[l][6], v[l][7]), (v2, v3, v4, v5, v6, v4 + v6), "wave64={wave64} lane {l}");
+                    assert_eq!((mem[64 + l], mem[128 + l]), (v4, v6), "wave64={wave64} lane {l} mem");
+                } else {
+                    assert_eq!((v[l][2], v[l][3], v[l][4], v[l][5], v[l][6], v[l][7]), (0, 0, 0, 0, 0, 0), "wave64={wave64} lane {l}");
+                    assert_eq!((mem[64 + l], mem[128 + l]), (1064 + l32, 1128 + l32), "wave64={wave64} lane {l} mem");
+                }
+            }
+        }
+
+        // a single guarded VALU or load keeps its select rather than adding a branch
+        for single_op in [
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)][..]),
+            ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 1), ("ADDR", 0), ("SADDR", 125), ("OFFSET", 0)][..]),
+        ] {
+            let single = decode(&[
+                ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+                ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+                single_op,
+                ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+                ENDPGM,
+            ]);
+            let (ir, _) = lower_kernel(&single, false, Interp::default()).unwrap();
+            assert_eq!((ir.selects(), ir.br_ifs()), (1, 2), "{}", single_op.0);
+        }
+    }
+
+    #[test]
+    fn guard_coalescing_breaks_at_scalar_compare_and_cross_lane_ops() {
+        let (ir, stale) = lower_kernel(&decode(COALESCED_BREAKS), false, Interp::default()).unwrap();
+        assert!(stale.is_empty(), "{stale:?}");
+        assert_eq!((ir.selects(), ir.br_ifs()), (1, 6)); // only v_cndmask's select; 4 runs + entry/exit
+        let (s, v) = state(32);
+        let (s, v) = run(COALESCED_BREAKS, false, &s, &v);
+        assert_eq!((s[2], s[3], s[106], s[126]), (8, 10, 0xFF, u32::MAX));
+        for l in 0..32usize {
+            let l32 = l as u32;
+            let want = if l < 16 {
+                let (v1, v3) = (l32 + 7, l32 + 15);
+                let v4 = v3 ^ (v1 + l32);
+                (v1, v4, 10 + (if l < 8 { v4 } else { v3 }) + 3)
+            } else {
+                (0, 0, 0)
+            };
+            assert_eq!((v[l][1], v[l][4], v[l][7]), want, "lane {l}");
+        }
+
+        // two coalesced runs inside a partial block (with a scalar write in between) stay non-stale
+        let (s, v) = state(32);
+        let (_, v) = run(COALESCED_IN_PARTIAL, false, &s, &v);
+        for l in 0..32usize {
+            let l32 = l as u32;
+            let v4 = if l < 12 { l32 + 24 } else { 0 };
+            let v5 = if l < 24 { 12 + v4 } else { 0 };
+            assert_eq!((v[l][4], v[l][5], v[l][6]), (v4, v5, v5 + 1), "partial lane {l}");
+        }
+
+        // coalesced run inside a loop: 0 selects, SSA phis carry loop values cleanly
+        let (ir, _) = lower_kernel(&decode(COALESCED_IN_LOOP), false, Interp::default()).unwrap();
+        assert_eq!(ir.selects(), 0);
+        let (s, v) = state(32);
+        let (s, v) = run(COALESCED_IN_LOOP, false, &s, &v);
+        assert_eq!((s[2], s[126]), (4, u32::MAX));
+        for l in 0..32 {
+            assert_eq!((v[l][1], v[l][2]), if l < 16 { (4, 10) } else { (0, 0) }, "loop lane {l}");
+        }
+
+        // guarded VALU carry-out (VOP3_SDST_ENC) and cross-lane ds_swizzle split runs
+        let cs = decode(&[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 0)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 1)]),
+            ("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 3), ("SDST", 106), ("SRC0", V + 1), ("SRC1", V + 2)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 129), ("VSRC1", 3)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 130), ("VSRC1", 4)]),
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 6), ("ADDR", 5), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 129), ("VSRC1", 6)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 7)]),
+            ENDPGM,
+        ]);
+        let sum = lane_masks::analyze(&cs, false).unwrap();
+        let guarded: HashSet<u64> = sum.guarded.iter().copied().collect();
+        assert_eq!(coalesced_runs(&cs, &sum.blocks[0].insts, &guarded), vec![2..4, 5..7, 8..10]);
+    }
+
+    #[test]
+    fn coalesced_guarded_runs_agree_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner, translate, Options};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("coalesced breaks, wave32", COALESCED_BREAKS, false, &[]);
+        agrees_with_hlsl("coalesced in partial, wave32", COALESCED_IN_PARTIAL, false, &[]);
+        agrees_with_hlsl("coalesced in loop, wave32", COALESCED_IN_LOOP, false, &[]);
+        let check_mem = |wave64: bool| {
+            let (lines, lanes) = (coalesced_run(wave64), if wave64 { 64 } else { 32 });
+            let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+            let (s, v) = state(lanes);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let t = translate(&bytes, &Options { wave64, split_wave64: false, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{:?}", t.unsupported_why);
+            let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let mem = memory_image();
+            let gpu = runner::run(&dxil, &st, &mem).unwrap();
+            let (cs, cv, cmem) = run_mem(&lines, wave64, &s, &v, &mem);
+            assert_eq!(&gpu.mem[..cmem.len()], &cmem[..], "wave64={wave64}: memory");
+            for l in 0..lanes {
+                for r in 0..8 {
+                    assert_eq!(cv[l][r], gpu.vgpr[l][r], "wave64={wave64}: lane {l} v{r}");
+                }
+            }
+            assert_eq!(cs[126], gpu.sgpr[126]);
+            if wave64 {
+                assert_eq!(cs[127], gpu.sgpr[127]);
+            }
+        };
+        check_mem(false);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        check_mem(true);
     }
 }

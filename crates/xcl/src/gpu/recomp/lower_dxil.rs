@@ -469,7 +469,18 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
+        let run = coalesced_run(false);
+        for (name, lines) in [
+            ("straight", STRAIGHT),
+            ("skipped if", SKIPPED_IF),
+            ("leaving loop", LEAVING_LOOP),
+            ("uniform loop", UNIFORM_LOOP),
+            ("memory", MEMORY),
+            ("coalesced run", &run[..]),
+            ("coalesced breaks", COALESCED_BREAKS),
+            ("coalesced in partial", COALESCED_IN_PARTIAL),
+            ("coalesced in loop", COALESCED_IN_LOOP),
+        ] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);
@@ -662,5 +673,55 @@ mod tests {
         let out = runner::dispatch(&k.dxil, [3, 1, 1], &[100, 0], &mem).unwrap();
         let cpu = run_compute(COMPUTE, &cs, 3, &[100, 0], &mem);
         assert_eq!(&out[..cpu.len()], &cpu[..]);
+    }
+
+    /// Coalesced guarded runs lowered through `Ir::foreign` (`Lw::inst_guarded` with `guard = true`
+    /// inside the run's block): f32 arithmetic against HLSL, and 4-window memory load/store inside
+    /// a coalesced run (`Lw` making window-switch blocks inside the run) against the CPU lowering.
+    #[test]
+    fn coalesced_foreign_runs_agree_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        // 4-window compute: lanes with tid < 16 run a coalesced load + add + store via `foreign`
+        let cs = compute_cs();
+        let run = coalesced_run(false);
+        let bytes: Vec<u8> = run.iter().flat_map(encode_line).collect();
+        let o = super::KernelOptions { wave64: false, split: false, mem_windows: 4, sampler_base: 0 };
+        let k = super::compute_with(&bytes, &cs, o).unwrap();
+        let mem = memory_image();
+        let out = runner::dispatch(&k.dxil, [1, 1, 1], &[0, 0], &mem).unwrap();
+        let cpu = run_compute(&run, &cs, 1, &[0, 0], &mem);
+        assert_eq!(&out[..cpu.len()], &cpu[..], "4-window coalesced memory via foreign");
+
+        // split wave64 compute: runs coalesced wave64 (cut = 40, spanning both wave32 halves) on 32-lane hardware
+        let run64 = coalesced_run(true);
+        let dxil64 = super::compute_split(&decode(&run64), &cs).unwrap();
+        let out64 = runner::dispatch(&dxil64, [1, 1, 1], &[0, 0], &mem).unwrap();
+        let cpu64 = run_compute_waves(&run64, &cs, true, 1, &[0, 0], &mem);
+        assert_eq!(&out64[..cpu64.len()], &cpu64[..], "split wave64 coalesced run");
+
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let bytes: Vec<u8> = COALESCED_F32_RUN.iter().flat_map(encode_line).collect();
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+        let (dxil, _) = super::kernel(&decode(COALESCED_F32_RUN), false).unwrap();
+        let direct = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            for r in 0..=5 {
+                assert_eq!(direct.vgpr[l][r], hlsl.vgpr[l][r], "lane {l} v{r}");
+            }
+        }
+        assert_eq!((direct.sgpr[106], direct.sgpr[126]), (hlsl.sgpr[106], hlsl.sgpr[126]));
     }
 }
